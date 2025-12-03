@@ -414,12 +414,6 @@ class FeatureBank:
         # Normalize so visuals are scale-independent
         rms_norm = min(1.0, rms / self.max_rms) if self.max_rms > 0 else 0.0
         cent_norm = min(1.0, centroid / self.max_centroid) if self.max_centroid > 0 else 0.0
-
-        # Slight non-linear boost so mid values still matter,
-        # but dialed back vs previous version so it's not over-exaggerated.
-        rms_norm = min(1.0, (rms_norm ** 0.85) * 1.2)
-        cent_norm = min(1.0, (cent_norm ** 0.85) * 1.2)
-
         return {
             "rms": rms_norm,
             "centroid": cent_norm,
@@ -497,11 +491,11 @@ class PerlinVisualizer:
             "viola": ("#0ea5e9", "#a3e635"),    # teal -> lime
         }
 
-        # Perlin parameters (softened a bit to look less chaotic)
+        # Perlin parameters
         self.grid_size = 96
-        self.noise_scale_x = 260.0
-        self.noise_scale_y = 260.0
-        self.flow_speed = 0.035
+        self.noise_scale_x = 220.0
+        self.noise_scale_y = 220.0
+        self.flow_speed = 0.05
         self.gradients = self._generate_gradients()
 
         # Precomputed segments per view: list of (xmax, x0, y0, x1, y1, color, width)
@@ -510,8 +504,13 @@ class PerlinVisualizer:
         self.drawn_until = {"mix": 0.0, "violin": 0.0, "viola": 0.0}
         self._build_job = None
 
+        # Track last known canvas size so we don't rebuild unnecessarily
+        self._last_size = None
+
         bus.subscribe("app:newAudio", self._on_new_audio)
         bus.subscribe("app:setActiveView", self._on_active_view)
+        # NEW: react to canvas size changes so the visual scales with window size
+        bus.subscribe("visual:canvasResized", self._on_canvas_resized)
 
     # ----------- event handlers ---------------------------------------
 
@@ -524,6 +523,41 @@ class PerlinVisualizer:
         # When the user switches tabs, we simply store the new active view.
         if detail and "view" in detail:
             self.state.active_view = detail["view"]
+
+    def _on_canvas_resized(self, detail):
+        """
+        Called when the canvases are resized.
+
+        We only care about the "mix" canvas size, since that defines
+        the base coordinate system for all three views.
+
+        To keep it efficient:
+        - ignore events when no audio is loaded (duration == 0)
+        - only rebuild if the size actually changed
+        """
+        if not detail:
+            return
+        if detail.get("view") != "mix":
+            # We use the mix canvas as the reference for all views.
+            return
+
+        w = detail.get("width", 0)
+        h = detail.get("height", 0)
+        if w <= 0 or h <= 0:
+            return
+
+        if self._last_size == (w, h):
+            # No actual change – nothing to do.
+            return
+        self._last_size = (w, h)
+
+        if self.state.duration <= 0:
+            # No audio loaded yet; nothing to rebuild.
+            return
+
+        # Clear and rebuild segments adapted to the new size.
+        self.reset(wipe_segments=True)
+        self._schedule_build()
 
     # ----------- reset / build management ------------------------------
 
@@ -582,15 +616,16 @@ class PerlinVisualizer:
     def _build_segments(self):
         """
         Precompute trajectories for all three views.
-        We do this once per audio clip so playback is cheap.
+        We do this once per audio clip (or resize) so playback is cheap.
         """
         self._build_job = None
         self.gradients = self._generate_gradients()
 
         # We use the mix canvas as reference for sizing
         base_canvas = self.canvases["mix"]
-        width = max(400, base_canvas.winfo_width() or 1200)
-        height = max(300, base_canvas.winfo_height() or 700)
+        # UPDATED: use actual canvas size so the visual scales with window size
+        width = max(1, base_canvas.winfo_width() or 1)
+        height = max(1, base_canvas.winfo_height() or 1)
         duration = max(self.state.duration, 1.0)
 
         for view in ["mix", "violin", "viola"]:
@@ -613,17 +648,16 @@ class PerlinVisualizer:
             - move according to the Perlin field
             - stroke properties depend on features at the corresponding time
 
-        Mapping (Nico):
-            - RMS (loudness)   -> thickness
-            - centroid         -> step length + color blend
+        Mapping:
+            - RMS -> thickness
+            - centroid -> step length + color blend between color_low and color_high
         """
         # For variety between instruments we use view-specific seeds
         seed_map = {"mix": 111, "violin": 123, "viola": 321}
         rng = random.Random(seed_map.get(view_key, 0))
 
-        # Slightly fewer particles / steps so it's less dense and chaotic
-        particles = 260
-        steps = 120
+        particles = 340          # more = denser image, but heavier CPU
+        steps = 150              # more = longer trails
 
         segments = []
 
@@ -637,9 +671,11 @@ class PerlinVisualizer:
                 rms = feats["rms"]
                 centroid = feats["centroid"]
 
-                # Softer mapping: still reactive, but not as chunky/thick
-                thickness = 0.3 + rms * 4.5       # thinner overall vs previous version
-                step_len = 0.6 + centroid * 6.5   # slightly shorter trails
+                # Map features -> visual properties
+                #   - louder = thicker lines
+                #   - brighter tone = longer steps and more towards high color
+                thickness = 0.4 + rms * 5.0
+                step_len = 0.8 + centroid * 6.0
 
                 color = _color_lerp(color_low, color_high, centroid)
 
@@ -729,7 +765,8 @@ class AudioController:
     NEW: Uses sounddevice to actually play back the audio:
 
     - Only the currently active tab's audio is audible.
-    - Switching tabs stops audio; user presses Play again on the new tab.
+    - Switching tabs while playing restarts playback for that view
+      at the *same* time position.
     """
 
     def __init__(self, bus, state):
@@ -752,18 +789,16 @@ class AudioController:
 
     def _on_active_view(self, detail):
         """
-        When the user changes the visible tab, we stop any ongoing audio.
-
-        This matches the requirement:
-        - each tab has its own audio
-        - audio stops when the tab is not viewed
+        When the user changes the visible tab, we either:
+        - start playback for the new view (if playing),
+        - or make sure all audio is stopped.
         """
         if detail and "view" in detail:
             self.state.active_view = detail["view"]
-
-        # Stop both the sounddevice stream and the logical "playing" flag
-        self.playing = False
-        self._stop_audio()
+        if self.playing:
+            self._start_playback_for_active_view()
+        else:
+            self._stop_audio()
 
     def set_signals(self, mix, violin, viola, sr):
         """
@@ -796,13 +831,7 @@ class AudioController:
         current time position, using sounddevice.
         """
         if sd is None:
-            # If sounddevice is not available, we show a warning once.
-            print("[AudioController] sounddevice not available; no playback.")
-            messagebox.showwarning(
-                "Playback not available",
-                "sounddevice is not installed, so audio cannot be played back.\n"
-                "Install it with: pip install sounddevice"
-            )
+            # If sounddevice is not available, we silently skip playback.
             self.current_view_playing = None
             return
 
@@ -819,26 +848,17 @@ class AudioController:
         segment = sig[start_idx:]
 
         # Stop any previous playback and start this one
-        try:
-            sd.stop()
-            if len(segment) > 0:
-                sd.play(segment, samplerate=self.sample_rate, blocking=False)
-                self.current_view_playing = view
-            else:
-                self.current_view_playing = None
-        except Exception as e:
-            # If PortAudio or device errors happen, surface them to the user
-            print("[AudioController] Playback error:", e)
-            messagebox.showerror("Audio playback error", f"Could not play audio:\n{e}")
+        sd.stop()
+        if len(segment) > 0:
+            sd.play(segment, samplerate=self.sample_rate, blocking=False)
+            self.current_view_playing = view
+        else:
             self.current_view_playing = None
 
     def _stop_audio(self):
         """Stop any ongoing playback."""
         if sd is not None:
-            try:
-                sd.stop()
-            except Exception as e:
-                print("[AudioController] Error stopping audio:", e)
+            sd.stop()
         self.current_view_playing = None
 
     def step(self, dt):
@@ -859,7 +879,7 @@ class AudioController:
         return self.current_time
 
     def play(self):
-        """Called when user hits Play on the current tab."""
+        """Called when user hits Play."""
         if self.duration <= 0:
             return
         self.playing = True
@@ -1080,11 +1100,23 @@ class VisualizerApp(tk.Tk):
         self.canvas_violin = tk.Canvas(self.notebook, bg="#020617", highlightthickness=1, highlightbackground=self.c_line)
         self.canvas_viola = tk.Canvas(self.notebook, bg="#020617", highlightthickness=1, highlightbackground=self.c_line)
 
-        self.notebook.add(self.canvas_mix, text="Original mix")
-        self.notebook.add(self.canvas_violin, text="Violin")
-        self.notebook.add(self.canvas_viola, text="Viola")
+        # UI tab texts
+        self.notebook.add(self.canvas_mix, text="Original mix") 
+        self.notebook.add(self.canvas_violin, text="Viola")
+        self.notebook.add(self.canvas_viola, text="Violin")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
+        # NEW: when canvases resize, let the visualizer know so it can scale
+        for canvas, view_key in [
+            (self.canvas_mix, "mix"),
+            (self.canvas_violin, "viola"),
+            (self.canvas_viola, "violin"),
+        ]:
+            canvas.bind(
+                "<Configure>",
+                lambda event, vk=view_key: self._on_canvas_configure(event, vk),
+            )
 
         # Attach the real canvases to the visualizer now
         self.visualizer.canvases["mix"] = self.canvas_mix
@@ -1296,13 +1328,29 @@ class VisualizerApp(tk.Tk):
     def _on_tab_change(self, _event=None):
         """
         When the user clicks a different tab, tell everyone which
-        logical view is now active. AudioController will stop audio
-        (and the user can press Play again on the new tab).
+        logical view is now active. AudioController will switch
+        audible playback to that view if we are currently playing.
         """
         idx = self.notebook.index(self.notebook.select())
         view_key = {0: "mix", 1: "violin", 2: "viola"}.get(idx, "mix")
         self.state.active_view = view_key
         self.bus.dispatch("app:setActiveView", {"view": view_key})
+
+    def _on_canvas_configure(self, event, view_key):
+        """
+        Called whenever one of the canvases changes size (window resized,
+        notebook pane resized, etc.). We forward this to the Perlin
+        visualizer through the event bus so it can rebuild the field
+        to match the new dimensions.
+        """
+        self.bus.dispatch(
+            "visual:canvasResized",
+            {
+                "view": view_key,
+                "width": event.width,
+                "height": event.height,
+            },
+        )
 
     def _on_media_state(self, detail):
         if not detail:
