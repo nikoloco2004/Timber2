@@ -27,18 +27,19 @@ High-level flow:
    - the viola stem
 
 4. Nico’s Perlin field uses those features to control:
-   - stroke thickness  (RMS -> louder = thicker lines)
-   - stroke length     (centroid -> brighter tone = longer strokes)
-   - subtle color shifts (centroid -> slightly brighter / darker color)
+   - stroke thickness      (RMS -> louder = thicker lines)
+   - stroke length         (centroid -> brighter tone = longer strokes)
+   - stroke color (blend)  (centroid -> smoothly blends between two colors)
 
 5. Jan’s UI shows 3 tabs:
    - Original mix
    - Violin
    - Viola
 
-   Each tab has its own Perlin visual, and shares the same time line.
-   “Play” starts the animation from time zero; “Reset” clears the canvases
-   so a new clip can be loaded.
+   Each tab:
+   - Plays its own audio (via sounddevice) when visible and “Play” is active
+   - Stops audio when you switch away
+   - Has its own Perlin field, revealed left-to-right as time advances
 """
 
 # -------------------- STANDARD IMPORTS --------------------  # (shared)
@@ -53,7 +54,7 @@ from tkinter import ttk, filedialog, colorchooser, messagebox
 
 # Optional audio / DSP libraries
 try:
-    import sounddevice as sd  # Used by Tejas for recording
+    import sounddevice as sd  # Used by Tejas (recording) and playback
 except Exception:
     sd = None
 
@@ -66,6 +67,8 @@ from scipy.io.wavfile import write as wav_write
 # Aidan’s model dependencies
 from sklearn.decomposition import NMF
 import scipy.signal as signal
+import matplotlib.pyplot as plt  # kept for completeness with original code (not used here)
+
 
 # -----------------------------------------------------------
 # SMALL HELPER (shared)
@@ -355,7 +358,6 @@ class FeatureBank:
             }
             return
 
-        # Hann window for smooth edges
         frames = 1 + max(0, (len(signal_arr) - win_size) // hop)
         window = np.hanning(win_size)
 
@@ -364,12 +366,14 @@ class FeatureBank:
 
         for i in range(frames):
             start = i * hop
-            frame = signal_arr[start : start + win_size]
+            frame = signal_arr[start: start + win_size]
             if len(frame) < win_size:
                 frame = np.pad(frame, (0, win_size - len(frame)))
             frame = frame * window
+
             # RMS loudness in this frame
             rms_vals[i] = math.sqrt(float(np.mean(frame**2)) + 1e-12)
+
             # Spectrum for centroid
             spectrum = np.fft.rfft(frame)
             mag_spec[:, i] = np.abs(spectrum)
@@ -416,21 +420,33 @@ class FeatureBank:
         }
 
 
-# ---- Perlin noise utilities ------------------------------------------
+# ---- Color helpers for Nico’s Perlin mapping -------------------------
 
-def _hex_adjust(color, factor):
-    """
-    Lighten or darken a hex color by multiplying each RGB channel
-    by 'factor' ( >1 = lighter, <1 = darker).
-    """
+def _hex_to_rgb(color):
     color = color.lstrip("#")
-    r = int(color[0:2], 16)
-    g = int(color[2:4], 16)
-    b = int(color[4:6], 16)
-    r = max(0, min(255, int(r * factor)))
-    g = max(0, min(255, int(g * factor)))
-    b = max(0, min(255, int(b * factor)))
+    return (
+        int(color[0:2], 16),
+        int(color[2:4], 16),
+        int(color[4:6], 16),
+    )
+
+
+def _rgb_to_hex(r, g, b):
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _color_lerp(c1, c2, alpha):
+    """
+    Linearly blend two hex colors c1 and c2 with factor alpha in [0,1].
+    alpha=0 -> c1, alpha=1 -> c2.
+    """
+    alpha = max(0.0, min(1.0, alpha))
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    r = int(r1 + (r2 - r1) * alpha)
+    g = int(g1 + (g2 - g1) * alpha)
+    b = int(b1 + (b2 - b1) * alpha)
+    return _rgb_to_hex(r, g, b)
 
 
 class PerlinVisualizer:
@@ -446,9 +462,13 @@ class PerlinVisualizer:
 
     How features control the visual:
 
-    - rms (loudness)     -> line thickness (louder = thicker)
-    - centroid (brightness) -> stroke length & subtle color shift
-    - time t             -> horizontal position (left = early, right = late)
+    - rms (loudness)
+        -> line thickness (louder = thicker lines)
+    - centroid (brightness)
+        -> stroke length (higher centroid = longer strokes)
+        -> color blend (low centroid = base color A, high = color B)
+    - time t
+        -> horizontal position (left = early; right = late)
     """
 
     def __init__(self, bus, state, feature_bank,
@@ -464,11 +484,11 @@ class PerlinVisualizer:
         # For scheduling redraws
         self.canvas = canvas_mix
 
-        # Base colors for each view
-        self.base_colors = {
-            "mix": "#f97316",     # orange for original blend
-            "violin": "#a855f7",  # purple
-            "viola": "#22d3ee",   # teal
+        # Base color pairs for each view (low centroid -> first, high -> second)
+        self.color_pairs = {
+            "mix": ("#4c1d95", "#f97316"),      # deep purple -> bright orange
+            "violin": ("#7c3aed", "#fb7185"),   # violet -> pink
+            "viola": ("#0ea5e9", "#a3e635"),    # teal -> lime
         }
 
         # Perlin parameters
@@ -568,16 +588,16 @@ class PerlinVisualizer:
         duration = max(self.state.duration, 1.0)
 
         for view in ["mix", "violin", "viola"]:
-            color = self.base_colors[view]
+            c1, c2 = self.color_pairs[view]
             self.segments[view] = self._generate_segments_for_view(
-                view, color, width, height, duration
+                view, c1, c2, width, height, duration
             )
             self.segments[view].sort(key=lambda seg: seg[0])
 
         self.segment_indices = {k: 0 for k in self.segment_indices}
         self.drawn_until = {k: 0.0 for k in self.drawn_until}
 
-    def _generate_segments_for_view(self, view_key, base_color, width, height, duration):
+    def _generate_segments_for_view(self, view_key, color_low, color_high, width, height, duration):
         """
         Generate a bunch of Perlin-guided strokes for a given view
         ("mix", "violin", or "viola").
@@ -586,12 +606,16 @@ class PerlinVisualizer:
             - start at random positions
             - move according to the Perlin field
             - stroke properties depend on features at the corresponding time
+
+        Mapping:
+            - RMS -> thickness
+            - centroid -> step length + color blend between color_low and color_high
         """
         # For variety between instruments we use view-specific seeds
         seed_map = {"mix": 111, "violin": 123, "viola": 321}
         rng = random.Random(seed_map.get(view_key, 0))
 
-        particles = 320          # more = denser image, but heavier CPU
+        particles = 340          # more = denser image, but heavier CPU
         steps = 150              # more = longer trails
 
         segments = []
@@ -608,12 +632,11 @@ class PerlinVisualizer:
 
                 # Map features -> visual properties
                 #   - louder = thicker lines
-                #   - brighter tone = longer steps and brighter color
-                thickness = 0.8 + rms * 3.0
-                step_len = 1.0 + centroid * 3.0
+                #   - brighter tone = longer steps and more towards high color
+                thickness = 0.4 + rms * 5.0
+                step_len = 0.8 + centroid * 6.0
 
-                color_factor = 0.7 + centroid * 0.6
-                color = _hex_adjust(base_color, color_factor)
+                color = _color_lerp(color_low, color_high, centroid)
 
                 # Perlin noise controls direction of travel
                 nx = (x / self.noise_scale_x) + t * self.flow_speed
@@ -698,9 +721,11 @@ class AudioController:
     Manages audio data for all three views and drives the global
     playback clock used by the visualizer.
 
-    For simplicity, this version *does not* play sound through speakers
-    (only the visuals move). You could plug in an audio playback library
-    later without changing the visual logic.
+    NEW: Uses sounddevice to actually play back the audio:
+
+    - Only the currently active tab's audio is audible.
+    - Switching tabs while playing restarts playback for that view
+      at the *same* time position.
     """
 
     def __init__(self, bus, state):
@@ -717,13 +742,22 @@ class AudioController:
         self.duration = 0.0
         self.current_time = 0.0
         self.playing = False
+        self.current_view_playing = None  # which view's audio is currently sent to sounddevice
 
         bus.subscribe("app:setActiveView", self._on_active_view)
 
     def _on_active_view(self, detail):
-        # No special action needed yet — visuals read state.active_view.
-        # This is a hook in case we later add per-view audio playback.
-        pass
+        """
+        When the user changes the visible tab, we either:
+        - start playback for the new view (if playing),
+        - or make sure all audio is stopped.
+        """
+        if detail and "view" in detail:
+            self.state.active_view = detail["view"]
+        if self.playing:
+            self._start_playback_for_active_view()
+        else:
+            self._stop_audio()
 
     def set_signals(self, mix, violin, viola, sr):
         """
@@ -734,17 +768,57 @@ class AudioController:
         self.signals["viola"] = viola
         self.sample_rate = sr
 
-        # We assume all stems share the same length as the original.
+        # Use the mix length as the time base
         self.duration = len(mix) / float(sr) if mix is not None else 0.0
         self.current_time = 0.0
         self.state.duration = self.duration
         self.state.current = 0.0
+
+        self.playing = False
+        self.current_view_playing = None
+        self._stop_audio()
 
         self.bus.dispatch("media:state", {
             "status": "paused",
             "duration": self.duration,
             "currentTime": self.current_time,
         })
+
+    def _start_playback_for_active_view(self):
+        """
+        Start audio playback for the currently active tab from the
+        current time position, using sounddevice.
+        """
+        if sd is None:
+            # If sounddevice is not available, we silently skip playback.
+            self.current_view_playing = None
+            return
+
+        view = self.state.active_view
+        sig = self.signals.get(view)
+        if sig is None:
+            self.current_view_playing = None
+            sd.stop()
+            return
+
+        # Starting index according to current_time
+        start_idx = int(max(0.0, min(self.current_time, self.duration)) * self.sample_rate)
+        start_idx = min(len(sig), start_idx)
+        segment = sig[start_idx:]
+
+        # Stop any previous playback and start this one
+        sd.stop()
+        if len(segment) > 0:
+            sd.play(segment, samplerate=self.sample_rate, blocking=False)
+            self.current_view_playing = view
+        else:
+            self.current_view_playing = None
+
+    def _stop_audio(self):
+        """Stop any ongoing playback."""
+        if sd is not None:
+            sd.stop()
+        self.current_view_playing = None
 
     def step(self, dt):
         """
@@ -755,20 +829,28 @@ class AudioController:
 
         self.current_time += dt
         if self.duration > 0 and self.current_time >= self.duration:
+            # Reached end: stop both animation and audio
             self.current_time = self.duration
             self.playing = False
+            self._stop_audio()
 
         self.state.current = self.current_time
         return self.current_time
 
     def play(self):
+        """Called when user hits Play."""
+        if self.duration <= 0:
+            return
         self.playing = True
         self.current_time = 0.0
         self.state.status = "playing"
+        self._start_playback_for_active_view()
 
     def pause(self):
+        """Called when user hits Pause."""
         self.playing = False
         self.state.status = "paused"
+        self._stop_audio()
 
 
 # =====================================================================
@@ -835,6 +917,10 @@ class VisualizerApp(tk.Tk):
     - Reset button
     - Mode selector (for future extension)
     - Tabs for Mix / Violin / Viola Perlin visuals
+
+    New in this version:
+    - Very obvious "Record from Mic" button in the top bar
+    - Slightly more modern styling (bigger title, spacing, muted text)
     """
 
     def __init__(self, bus, state, feature_bank, audio_ctrl, visualizer):
@@ -846,16 +932,17 @@ class VisualizerApp(tk.Tk):
         self.visualizer = visualizer
 
         self.title("TimberMind – Instrument Visualizer")
-        self.geometry("1150x720")
-        self.minsize(900, 560)
+        self.geometry("1180x740")
+        self.minsize(960, 580)
 
-        # Core colors for a dark, minimal look.
-        self.c_bg = "#0c0f16"
-        self.c_panel = "#111827"
-        self.c_line = "#1f2937"
-        self.c_accent = "#4f46e5"
+        # Core colors for a dark, modern look.
+        self.c_bg = "#020617"
+        self.c_panel = "#020617"
+        self.c_card = "#020617"
+        self.c_line = "#1e293b"
+        self.c_accent = "#6366f1"
         self.c_text = "#e5e7eb"
-        self.c_muted = "#9ca3af"
+        self.c_muted = "#64748b"
 
         self.mode_var = tk.StringVar(value="perlin")
 
@@ -872,29 +959,86 @@ class VisualizerApp(tk.Tk):
         style.theme_use("clam")
         style.configure("TFrame", background=self.c_bg)
         style.configure("TLabel", background=self.c_bg, foreground=self.c_text, font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background=self.c_bg, foreground=self.c_muted, font=("Segoe UI", 10))
-        style.configure("TButton", background=self.c_panel, foreground=self.c_text, borderwidth=0, padding=8)
-        style.map("TButton", background=[("active", self.c_line)])
-        style.configure("Card.TFrame", background=self.c_panel)
-        style.configure("Card.TLabelframe", background=self.c_panel, foreground=self.c_text)
-        style.configure("Card.TLabelframe.Label", background=self.c_panel, foreground=self.c_muted)
+        style.configure("Muted.TLabel", background=self.c_bg, foreground=self.c_muted, font=("Segoe UI", 9))
+        style.configure(
+            "Primary.TButton",
+            background=self.c_accent,
+            foreground="#0f172a",
+            borderwidth=0,
+            padding=8,
+            focusthickness=0,
+        )
+        style.map("Primary.TButton", background=[("active", "#4f46e5")])
+        style.configure(
+            "Ghost.TButton",
+            background="#0f172a",
+            foreground=self.c_text,
+            borderwidth=1,
+            padding=8,
+            focusthickness=0,
+            relief="flat",
+        )
+        style.map("Ghost.TButton", background=[("active", "#111827")])
+        style.configure("Card.TFrame", background="#020617")
+        style.configure("Card.TLabelframe", background="#020617", foreground=self.c_text)
+        style.configure("Card.TLabelframe.Label", background="#020617", foreground=self.c_muted)
         style.configure("Time.TLabel", background=self.c_bg, foreground=self.c_muted, font=("Segoe UI", 10, "bold"))
 
     def _build_layout(self):
         # Top bar
-        top = ttk.Frame(self, padding=(16, 12))
+        top = ttk.Frame(self, padding=(20, 16))
         top.pack(side="top", fill="x")
-        ttk.Label(top, text="TimberMind – Instrument Visualizer", font=("Segoe UI", 14, "bold")).pack(side="left")
 
-        self.time_lbl = ttk.Label(top, text="00:00 / 00:00", style="Time.TLabel")
-        self.time_lbl.pack(side="right", padx=12)
+        # Left: title and subtitle
+        title_box = ttk.Frame(top, style="TFrame")
+        title_box.pack(side="left", anchor="w")
+        ttk.Label(
+            title_box,
+            text="TimberMind",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            title_box,
+            text="Violin & Viola timbre visualizer – mix, separate, and *see* the sound.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
 
-        ttk.Button(top, text="Reset Canvas", command=self._on_reset).pack(side="right", padx=6)
-        ttk.Button(top, text="Pause", command=self._on_pause).pack(side="right", padx=6)
-        ttk.Button(top, text="Play", command=self._on_play).pack(side="right", padx=6)
+        # Right: transport + recording controls
+        right_box = ttk.Frame(top, style="TFrame")
+        right_box.pack(side="right", anchor="e")
+
+        # Big Record button (very visible)
+        ttk.Button(
+            right_box,
+            text="● Record from Mic",
+            style="Primary.TButton",
+            command=self._on_record,
+        ).pack(side="right", padx=(8, 0))
+
+        ttk.Button(
+            right_box,
+            text="Upload .wav",
+            style="Ghost.TButton",
+            command=self._on_upload,
+        ).pack(side="right", padx=8)
+
+        ttk.Button(
+            right_box,
+            text="Reset Canvas",
+            style="Ghost.TButton",
+            command=self._on_reset,
+        ).pack(side="right", padx=8)
+
+        # Play / Pause + time
+        transport_box = ttk.Frame(right_box, style="TFrame")
+        transport_box.pack(side="right", padx=(0, 8))
+        ttk.Button(transport_box, text="▶ Play", style="Ghost.TButton", command=self._on_play).pack(side="left", padx=(0, 4))
+        ttk.Button(transport_box, text="⏸ Pause", style="Ghost.TButton", command=self._on_pause).pack(side="left", padx=(0, 4))
+        self.time_lbl = ttk.Label(transport_box, text="00:00 / 00:00", style="Time.TLabel")
+        self.time_lbl.pack(side="left", padx=(6, 0))
 
         # Body: left controls, right canvases
-        body = ttk.Frame(self, padding=(16, 0, 16, 16))
+        body = ttk.Frame(self, padding=(20, 0, 20, 20))
         body.pack(fill="both", expand=True)
 
         controls = ttk.Frame(body, width=320)
@@ -911,9 +1055,9 @@ class VisualizerApp(tk.Tk):
         self.notebook = ttk.Notebook(canvas_frame)
         self.notebook.pack(fill="both", expand=True, padx=4, pady=4)
 
-        self.canvas_mix = tk.Canvas(self.notebook, bg="#050509", highlightthickness=1, highlightbackground=self.c_line)
-        self.canvas_violin = tk.Canvas(self.notebook, bg="#050509", highlightthickness=1, highlightbackground=self.c_line)
-        self.canvas_viola = tk.Canvas(self.notebook, bg="#050509", highlightthickness=1, highlightbackground=self.c_line)
+        self.canvas_mix = tk.Canvas(self.notebook, bg="#020617", highlightthickness=1, highlightbackground=self.c_line)
+        self.canvas_violin = tk.Canvas(self.notebook, bg="#020617", highlightthickness=1, highlightbackground=self.c_line)
+        self.canvas_viola = tk.Canvas(self.notebook, bg="#020617", highlightthickness=1, highlightbackground=self.c_line)
 
         self.notebook.add(self.canvas_mix, text="Original mix")
         self.notebook.add(self.canvas_violin, text="Violin")
@@ -921,7 +1065,7 @@ class VisualizerApp(tk.Tk):
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
 
-        # Now that canvases exist, tell the visualizer which widgets to use
+        # Attach the real canvases to the visualizer now
         self.visualizer.canvases["mix"] = self.canvas_mix
         self.visualizer.canvases["violin"] = self.canvas_violin
         self.visualizer.canvases["viola"] = self.canvas_viola
@@ -930,22 +1074,23 @@ class VisualizerApp(tk.Tk):
     # ---------- left panel sections -----------------------------------
 
     def _input_section(self, parent):
-        box = ttk.Labelframe(parent, text="Input / Recording", style="Card.TLabelframe")
+        box = ttk.Labelframe(parent, text="Input / Analysis", style="Card.TLabelframe")
         box.pack(fill="x", pady=8)
 
-        # Audio source explanation
         ttk.Label(
             box,
-            text="Choose an audio source (Jan UI):\n"
-                 "• Upload a .wav with violin + viola\n"
-                 "• Or record from a microphone (Tejas)",
+            text="Choose how to provide audio (Jan UI):",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+
+        ttk.Label(
+            box,
+            text="1. Use the large 'Record from Mic' button above (Tejas)\n"
+                 "2. Or click 'Upload .wav' to load a mixed track",
             style="Muted.TLabel",
             wraplength=280,
             justify="left",
-        ).pack(anchor="w", padx=10, pady=(6, 4))
-
-        # Upload button
-        ttk.Button(box, text="Upload .wav file", command=self._on_upload).pack(fill="x", padx=10, pady=(4, 6))
+        ).pack(anchor="w", padx=10, pady=(0, 6))
 
         # --- Microphone device selection (Tejas) ---
         if sd is None:
@@ -959,11 +1104,10 @@ class VisualizerApp(tk.Tk):
             self.record_duration_var = None
             return
 
-        ttk.Label(box, text="Record from microphone:", style="Muted.TLabel").pack(
+        ttk.Label(box, text="Mic device:", style="Muted.TLabel").pack(
             anchor="w", padx=10, pady=(6, 2)
         )
 
-        # Device list
         devices = sd.query_devices()
         input_devices = [
             f"{i}: {d['name']}"
@@ -976,28 +1120,33 @@ class VisualizerApp(tk.Tk):
             self.device_box.current(0)
         self.device_box.pack(fill="x", padx=10, pady=(0, 4))
 
-        # Duration entry
         row = ttk.Frame(box, style="Card.TFrame")
         row.pack(fill="x", padx=10, pady=(0, 6))
         ttk.Label(row, text="Duration (s):", style="Muted.TLabel").pack(side="left")
         self.record_duration_var = tk.StringVar(value="5")
         ttk.Entry(row, textvariable=self.record_duration_var, width=6).pack(side="left", padx=(4, 0))
 
-        ttk.Button(box, text="Record & Analyze", command=self._on_record).pack(
-            fill="x", padx=10, pady=(2, 8)
-        )
+        ttk.Label(
+            box,
+            text="After recording or uploading, the app will:\n"
+                 "• run Aidan's separation model\n"
+                 "• compute Nico's features\n"
+                 "• generate Perlin fields for each tab",
+            style="Muted.TLabel",
+            wraplength=280,
+            justify="left",
+        ).pack(anchor="w", padx=10, pady=(4, 10))
 
     def _mode_section(self, parent):
         box = ttk.Labelframe(parent, text="Visualization Mode", style="Card.TLabelframe")
         box.pack(fill="x", pady=8)
         ttk.Label(
             box,
-            text="Currently only Perlin field is implemented.\n"
-                 "Other modes (waveform, spectrogram) could be\n"
-                 "added later.",
+            text="Currently only the Perlin field is implemented.\n"
+                 "Other modes (waveform, spectrogram) could be added later.",
             style="Muted.TLabel",
             wraplength=280,
-        ).pack(anchor="w", padx=10, pady=(4, 4))
+        ).pack(anchor="w", padx=10, pady=(6, 8))
 
     # ---------- UI event handlers -------------------------------------
 
@@ -1027,14 +1176,14 @@ class VisualizerApp(tk.Tk):
         # Parse duration
         try:
             duration = float(self.record_duration_var.get())
-            duration = max(1.0, min(30.0, duration))  # 1–30 seconds
+            duration = max(1.0, min(60.0, duration))  # 1–60 seconds
         except Exception:
-            messagebox.showerror("Invalid duration", "Please enter a number between 1 and 30.")
+            messagebox.showerror("Invalid duration", "Please enter a number between 1 and 60.")
             return
 
         # Determine selected device index
         device_index = None
-        if self.device_box is not None and self.device_var.get():
+        if hasattr(self, "device_box") and self.device_box is not None and self.device_var.get():
             try:
                 device_index = int(self.device_var.get().split(":", 1)[0])
             except Exception:
@@ -1102,7 +1251,7 @@ class VisualizerApp(tk.Tk):
         messagebox.showinfo(
             "Analysis complete",
             "Source separation and feature extraction are done.\n\n"
-            "Use Play / Pause and switch tabs to explore the fields."
+            "Use Play / Pause and switch tabs to explore the audio and fields."
         )
 
     def _on_play(self):
@@ -1126,7 +1275,8 @@ class VisualizerApp(tk.Tk):
     def _on_tab_change(self, _event=None):
         """
         When the user clicks a different tab, tell everyone which
-        logical view is now active.
+        logical view is now active. AudioController will switch
+        audible playback to that view if we are currently playing.
         """
         idx = self.notebook.index(self.notebook.select())
         view_key = {0: "mix", 1: "violin", 2: "viola"}.get(idx, "mix")
