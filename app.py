@@ -414,6 +414,12 @@ class FeatureBank:
         # Normalize so visuals are scale-independent
         rms_norm = min(1.0, rms / self.max_rms) if self.max_rms > 0 else 0.0
         cent_norm = min(1.0, centroid / self.max_centroid) if self.max_centroid > 0 else 0.0
+
+        # Slight non-linear boost so mid values still matter,
+        # but dialed back vs previous version so it's not over-exaggerated.
+        rms_norm = min(1.0, (rms_norm ** 0.85) * 1.2)
+        cent_norm = min(1.0, (cent_norm ** 0.85) * 1.2)
+
         return {
             "rms": rms_norm,
             "centroid": cent_norm,
@@ -491,11 +497,11 @@ class PerlinVisualizer:
             "viola": ("#0ea5e9", "#a3e635"),    # teal -> lime
         }
 
-        # Perlin parameters
+        # Perlin parameters (softened a bit to look less chaotic)
         self.grid_size = 96
-        self.noise_scale_x = 220.0
-        self.noise_scale_y = 220.0
-        self.flow_speed = 0.05
+        self.noise_scale_x = 260.0
+        self.noise_scale_y = 260.0
+        self.flow_speed = 0.035
         self.gradients = self._generate_gradients()
 
         # Precomputed segments per view: list of (xmax, x0, y0, x1, y1, color, width)
@@ -607,16 +613,17 @@ class PerlinVisualizer:
             - move according to the Perlin field
             - stroke properties depend on features at the corresponding time
 
-        Mapping:
-            - RMS -> thickness
-            - centroid -> step length + color blend between color_low and color_high
+        Mapping (Nico):
+            - RMS (loudness)   -> thickness
+            - centroid         -> step length + color blend
         """
         # For variety between instruments we use view-specific seeds
         seed_map = {"mix": 111, "violin": 123, "viola": 321}
         rng = random.Random(seed_map.get(view_key, 0))
 
-        particles = 340          # more = denser image, but heavier CPU
-        steps = 150              # more = longer trails
+        # Slightly fewer particles / steps so it's less dense and chaotic
+        particles = 260
+        steps = 120
 
         segments = []
 
@@ -630,11 +637,9 @@ class PerlinVisualizer:
                 rms = feats["rms"]
                 centroid = feats["centroid"]
 
-                # Map features -> visual properties
-                #   - louder = thicker lines
-                #   - brighter tone = longer steps and more towards high color
-                thickness = 0.4 + rms * 5.0
-                step_len = 0.8 + centroid * 6.0
+                # Softer mapping: still reactive, but not as chunky/thick
+                thickness = 0.3 + rms * 4.5       # thinner overall vs previous version
+                step_len = 0.6 + centroid * 6.5   # slightly shorter trails
 
                 color = _color_lerp(color_low, color_high, centroid)
 
@@ -724,8 +729,7 @@ class AudioController:
     NEW: Uses sounddevice to actually play back the audio:
 
     - Only the currently active tab's audio is audible.
-    - Switching tabs while playing restarts playback for that view
-      at the *same* time position.
+    - Switching tabs stops audio; user presses Play again on the new tab.
     """
 
     def __init__(self, bus, state):
@@ -748,16 +752,18 @@ class AudioController:
 
     def _on_active_view(self, detail):
         """
-        When the user changes the visible tab, we either:
-        - start playback for the new view (if playing),
-        - or make sure all audio is stopped.
+        When the user changes the visible tab, we stop any ongoing audio.
+
+        This matches the requirement:
+        - each tab has its own audio
+        - audio stops when the tab is not viewed
         """
         if detail and "view" in detail:
             self.state.active_view = detail["view"]
-        if self.playing:
-            self._start_playback_for_active_view()
-        else:
-            self._stop_audio()
+
+        # Stop both the sounddevice stream and the logical "playing" flag
+        self.playing = False
+        self._stop_audio()
 
     def set_signals(self, mix, violin, viola, sr):
         """
@@ -790,7 +796,13 @@ class AudioController:
         current time position, using sounddevice.
         """
         if sd is None:
-            # If sounddevice is not available, we silently skip playback.
+            # If sounddevice is not available, we show a warning once.
+            print("[AudioController] sounddevice not available; no playback.")
+            messagebox.showwarning(
+                "Playback not available",
+                "sounddevice is not installed, so audio cannot be played back.\n"
+                "Install it with: pip install sounddevice"
+            )
             self.current_view_playing = None
             return
 
@@ -807,17 +819,26 @@ class AudioController:
         segment = sig[start_idx:]
 
         # Stop any previous playback and start this one
-        sd.stop()
-        if len(segment) > 0:
-            sd.play(segment, samplerate=self.sample_rate, blocking=False)
-            self.current_view_playing = view
-        else:
+        try:
+            sd.stop()
+            if len(segment) > 0:
+                sd.play(segment, samplerate=self.sample_rate, blocking=False)
+                self.current_view_playing = view
+            else:
+                self.current_view_playing = None
+        except Exception as e:
+            # If PortAudio or device errors happen, surface them to the user
+            print("[AudioController] Playback error:", e)
+            messagebox.showerror("Audio playback error", f"Could not play audio:\n{e}")
             self.current_view_playing = None
 
     def _stop_audio(self):
         """Stop any ongoing playback."""
         if sd is not None:
-            sd.stop()
+            try:
+                sd.stop()
+            except Exception as e:
+                print("[AudioController] Error stopping audio:", e)
         self.current_view_playing = None
 
     def step(self, dt):
@@ -838,7 +859,7 @@ class AudioController:
         return self.current_time
 
     def play(self):
-        """Called when user hits Play."""
+        """Called when user hits Play on the current tab."""
         if self.duration <= 0:
             return
         self.playing = True
@@ -1275,8 +1296,8 @@ class VisualizerApp(tk.Tk):
     def _on_tab_change(self, _event=None):
         """
         When the user clicks a different tab, tell everyone which
-        logical view is now active. AudioController will switch
-        audible playback to that view if we are currently playing.
+        logical view is now active. AudioController will stop audio
+        (and the user can press Play again on the new tab).
         """
         idx = self.notebook.index(self.notebook.select())
         view_key = {0: "mix", 1: "violin", 2: "viola"}.get(idx, "mix")
