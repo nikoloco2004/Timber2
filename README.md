@@ -1,261 +1,243 @@
-Instrument Visualizer — Install & Run Guide
+# TimberMind – Instrument Visualizer (V1)
 
-This README explains how to set up and run the Instrument Visualizer prototype on your own computer. It covers:
+TimberMind is a desktop app that **records or loads audio**, **separates it into two stems**, and **visualizes the timbre over time** with a Perlin-noise flow field. It’s designed for explaining what’s happening inside a simple source-separation pipeline in a way that’s visually intuitive.
 
-Installing Python and dependencies
+> **Team roles**
+>
+> - **Tejas** – Microphone recording & WAV handling  
+> - **Aidan** – NMF-based source separation (mixed audio → 2 stems)  
+> - **Nico** – Audio feature extraction & Perlin-noise visualizer  
+> - **Jan** – Tkinter UI & event wiring  
 
-Setting up a virtual environment
+---
 
-Running each team member’s component (audio input, UI, Perlin visualizer / model output)
+## ✨ Features
 
-The instructions assume Windows, but the same steps work on macOS/Linux with minor command changes.
+- 🎤 **Record from microphone**  
+  - Large “Record from Mic” button in the top bar  
+  - Device selection & configurable duration  
 
-1. What’s in this project?
+- 🎧 **Load existing WAV files**  
+  - Upload a mixed violin+viola recording (`.wav`)  
+  - Automatically analyzed by the pipeline  
 
-This prototype combines four main pieces:
+- 🔀 **Source separation (NMF)**  
+  - Uses `sklearn.decomposition.NMF` on the magnitude STFT  
+  - Produces **two stem WAVs**:
+    - `*_source1.wav` → labeled as **“Violin”**
+    - `*_source2.wav` → labeled as **“Viola”**  
+  - Labels are for visualization; mathematically they’re just two NMF components  
 
-Audio input module (Tejas)
+- 📊 **Feature extraction** (per view)  
+  For each of: **mix**, **violin**, and **viola**:
+  - RMS loudness (frame-wise)
+  - Spectral centroid (brightness)
+  - Normalized so visuals scale nicely across clips
 
-Records from the microphone or loads a .wav file.
+- 🎨 **Perlin-noise visualizer**  
+  - One Perlin field per tab:
+    - **Original mix**
+    - **Viola**
+    - **Violin**
+  - Features control:
+    - RMS → line thickness (louder = thicker strokes)  
+    - Centroid → stroke length & color blend  
+    - Time → horizontal reveal (left to right across the canvas)
+  - Field is precomputed once per clip for smooth playback
 
-Outputs a 1D NumPy array (digital_signal) and a sample rate so other modules can treat audio as data.
+- 🖥️ **Tkinter UI**  
+  - Dark, minimal layout  
+  - Top bar: **Record, Upload, Reset, Play/Pause, time display**  
+  - 3-tab notebook for **Original mix / Viola / Violin** canvases  
+  - Uses a simple **EventBus** so UI, audio, and visuals are loosely coupled
 
-User Interface (Jan Paul)
+---
 
-A Tkinter desktop app (instrument_ui.py) with:
+## 🧱 Tech Stack
 
-Top bar (Upload / Play / Pause)
+- **Language:** Python 3.10+
+- **GUI:** Tkinter (`tk`, `ttk`)
+- **Audio I/O:** `sounddevice`, `soundfile`
+- **DSP:** `numpy`, `scipy`
+- **ML / Separation:** `scikit-learn` (`NMF`)
+- **Visualization:** Tkinter `Canvas` + custom Perlin noise implementation
 
-Sidebar pages: Home, Visualize, Models, Library, Settings
+---
 
-An internal event bus so teammates can hook in playback, ML, and visualization.
+## 📁 Project Structure (example)
 
-Instrument classification model (Aidan)
+You can adjust this to your actual repo layout, but a typical structure looks like:
 
-CNN trained on mel-spectrograms to classify cello, viola, violin 1, violin 2.
+```text
+TimberMind/
+├─ main.py                # <- the big integrated app shown in the prompt
+├─ requirements.txt
+├─ README.md
+├─ data/                  # (optional) example .wav files
+└─ docs/                  # (optional) screenshots, diagrams, report PDFs
+If your main file is not main.py, just update the run command in the sections below.
 
-Exposes model outputs that can later be visualized (e.g., which instrument is playing when).
+⚙️ Installation
+1. Clone the repository
+bash
+Copy code
+git clone https://github.com/<your-username>/TimberMind.git
+cd TimberMind
+2. Create a virtual environment
+Windows (PowerShell / CMD):
 
-Perlin-noise visualizer (Nicholas)
-
-Takes audio features (loudness, spectral centroid, etc.) and generates a Perlin flow field image or live animation that responds to the sound.
-
-2. Prerequisites
-2.1 Install Python
-
-Go to the official Python site and download Python 3.10 or newer.
-
-During installation on Windows, check:
-
-✅ “Add Python to PATH”
-
-To confirm it worked, open Command Prompt or PowerShell and run:
-
-python --version
-
-
-You should see something like Python 3.10.x or higher.
-
-On macOS/Linux, use python3 instead of python.
-
-3. Create a project folder
-
-Create a folder where you’ll keep everything, for example:
-
-InstrumentVisualizer/
-    audio_input/         # Tejas’ recording/loading scripts
-    ui/                  # Jan Paul's instrument_ui.py
-    visualizer/          # Nicholas’ Perlin visualizer
-    model/               # Aidan's CNN/model code (optional for now)
-
-
-Place the provided files into the appropriate subfolders. At minimum you should have:
-
-audio_input/tejas_audio.py (or similar, containing TEJAS SOURCE CODE V1 and V2)
-
-ui/instrument_ui.py
-
-(Names don’t have to match exactly, but keep them logical.)
-
-4. Set up a virtual environment
-
-From the root of the project (InstrumentVisualizer/):
-
-On Windows (PowerShell)
+bash
+Copy code
 python -m venv .venv
-.venv\Scripts\Activate
+.venv\Scripts\activate
+macOS / Linux:
 
-On macOS / Linux (terminal)
+bash
+Copy code
 python3 -m venv .venv
 source .venv/bin/activate
+You should see (.venv) at the start of your terminal prompt when it’s active.
 
+3. Install dependencies
+Make sure you have a requirements.txt with:
 
-When activated, your prompt will show something like (.venv) at the beginning.
+txt
+Copy code
+numpy
+scipy
+sounddevice
+soundfile
+matplotlib
+scikit-learn
+Then install:
 
-To deactivate later, just run:
+bash
+Copy code
+pip install -r requirements.txt
+tkinter is not in requirements.txt because it comes from your Python/OS install.
 
-deactivate
+On Ubuntu/Debian you may need: sudo apt install python3-tk
 
-5. Install Python dependencies
+▶️ Running the App
+From the project root (with the virtualenv activated):
 
-With the virtual environment activated, install the required packages.
+bash
+Copy code
+python main.py
+(or whatever your main file is called, e.g. python timbermind_app.py)
 
-5.1 Audio input & basic visualization
+If everything is set up correctly, a window titled “TimberMind – Instrument Visualizer” will open.
 
-Tejas’ code and the simple plot example need:
+🧩 How It Works (High-Level)
+Choose input
 
-sounddevice — record from microphone
+Click “Record from Mic” to record a new clip
 
-numpy — numerical arrays
+Or click “Upload .wav” to load an existing recording
 
-scipy — wavfile.read() for .wav files
+Source separation (Aidan)
 
-matplotlib — optional plotting
+Mixed audio is converted to a magnitude spectrogram via STFT (scipy.signal.stft)
 
-Install them:
+NMF (sklearn.decomposition.NMF) factorizes it into 2 components
 
-pip install sounddevice numpy scipy matplotlib
+Components are turned back into time-domain signals with soft masking + inverse STFT
 
+Two stem files are written:
 
-On some systems you may also need to install system audio drivers or permissions for microphone access.
+<base>_tm_source1.wav → visualized as “Violin”
 
-5.2 UI
+<base>_tm_source2.wav → visualized as “Viola”
 
-instrument_ui.py only uses the Python standard library (tkinter, ttk, os, filedialog), so no extra pip packages are required. Tkinter comes with most Python installs.
+Feature extraction (Nico)
 
-If Tkinter is missing, install it via your OS package manager (e.g., sudo apt install python3-tk on Ubuntu).
+For mix, violin, and viola:
 
-5.3 Optional: extra libs for Perlin visualizer / model
+Slice audio into overlapping windows
 
-Depending on how far you integrate Nicholas’ and Aidan’s code, you may also need (typical for that repo):
+Compute RMS and magnitude spectrum
 
-pip install soundfile pygame
+Compute spectral centroid from the magnitude spectrum
 
+Store times, rms, and centroid per frame in a FeatureBank
 
-If/when you bring in the CNN model, you’ll also install whatever ML library it uses (e.g., torch, torchaudio, etc.), but that’s optional for basic demo.
+Perlin field generation
 
-6. Running each component
-6.1 Audio input (Tejas)
+Each tab has a Perlin-based flow field built offline:
 
-Inside audio_input/, you should have the functions:
+A set of particles flow across the canvas
 
-record_audio(duration=5, sample_rate=44100, channels=1) — uses sounddevice to record live mic audio, returns digital_signal, sample_rate.
+Direction is given by Perlin noise
 
-load_audio(file_path) — uses scipy.io.wavfile.read to load a .wav, normalize it, and return digital_signal, sample_rate.
+At each step, the current time → look up features in FeatureBank
 
-A minimal test script (you can add this at the bottom of Tejas’ file):
+Features control:
 
-if __name__ == "__main__":
-    # Example: record 5 seconds from microphone
-    digital_signal, sr = record_audio(duration=5)
-    print("Recorded", len(digital_signal), "samples at", sr, "Hz")
+Stroke thickness (RMS)
 
-    # Example: plot the waveform (optional)
-    import matplotlib.pyplot as plt
-    plt.plot(digital_signal)
-    plt.title("Recorded audio")
-    plt.xlabel("Sample index")
-    plt.ylabel("Amplitude")
-    plt.show()
+Stroke length (centroid)
 
+Stroke color (centroid blend between a low-color and high-color)
 
-Run from the project root with:
+Playback & visualization
 
-python -m audio_input.tejas_audio
+AudioController manages audio arrays & global playback time
 
+PlaybackLoop steps the clock and calls PerlinVisualizer.render_frame()
 
-(or python tejas_audio.py if you run it directly in that folder.)
+The active tab’s canvas reveals more strokes from left to right as time progresses
 
-How to use it (from the report)
+Switching tabs:
 
-Open terminal / PowerShell.
+Keeps the same playback time
 
-Navigate to the script folder.
+Changes which stem you hear and which canvas is drawn onto
 
-Run the script.
+🕹️ Usage Tips
+Recording
 
-Speak during the 5-second window.
+Choose a device in the left “Input / Analysis” panel
 
-The output will be stored as a digital array (digital_signal) that other modules can consume.
+Set Duration (s)
 
-6.2 UI shell (Jan Paul)
+Click “Record from Mic”
 
-Inside ui/, you have instrument_ui.py. It creates:
+After it finishes, the app will automatically separate and visualize the clip
 
-A dark theme app window with top bar, navigation, and multiple pages.
+Uploading
 
-An EventBus so the UI can call external logic via events (app:loadFile, app:play, app:pause, app:setMode).
+Click “Upload .wav” and pick a mixed recording
 
-Run it from the project root:
+A message box will confirm when analysis is complete
 
-python -m ui.instrument_ui
+Tabs
 
+Original mix – whole mix visualized
 
-or from inside ui/:
+Viola – first stem (labeled Viola in UI)
 
-python instrument_ui.py
+Violin – second stem (labeled Violin in UI)
 
+Reset Canvas
 
-What you should see:
+Clears all three canvases so you can re-draw the fields from scratch
 
-A window titled “Instrument Visualizer — UI Shell”.
+Does not delete audio; you can hit Play again
 
-Top-left: circular IV logo and title “Instrument UI — Student Edition”.
+🧪 Known Limitations / Future Work
+NMF separation is unsupervised; stems are not guaranteed to be “true” violin/viola, they’re just two learned components.
 
-Top-right buttons: Upload, Play, Pause, 00:00 / 00:00.
+No model training is done inside this app; it operates purely on the loaded clip.
 
-Left sidebar with navigation: Home, Visualize, Models, Library, Settings.
+Currently only Perlin visualization mode is implemented; waveform / spectrogram views are possible future additions.
 
-From here:
+No persistent project saving yet – all processing happens in-memory per session.
 
-Click Upload → choose an audio file (.wav, etc.).
+👥 Contributors
+Tejas – Microphone recording & audio input
 
-The file name appears in the Library page’s listbox.
+Aidan – NMF-based source separation
 
-Events like "app:loadFile" print to the console (debug hooks).
+Nico – Feature extraction & Perlin field visualization
 
-At this stage, playback and advanced visuals are placeholders: the UI just dispatches events so the backend (audio/visual modules) can be wired in later.
-
-6.3 (Optional) Perlin visualizer & model integration
-
-If you clone Nicholas’ and Aidan’s GitHub repos and put them into visualizer/ and model/, you’ll:
-
-Install any extra requirements listed in their repos (e.g., torch, etc.).
-
-Write glue code that:
-
-Uses Tejas’ digital_signal and sample_rate.
-
-Feeds audio features into the Perlin visualizer to draw images on the UI canvas.
-
-Sends ML performance results back to the UI via the event bus ("ml:results") so the Models page can display them in the table.
-
-For the midterm demo, you only need the pieces you actually plan to show (e.g., UI + audio input + static visual).
-
-7. Common issues & tips
-
-Mic not recording / permission error
-
-Check OS privacy settings (microphone access must be enabled for the terminal / Python).
-
-Tkinter errors on Linux
-
-Install Tkinter separately: sudo apt install python3-tk.
-
-Virtualenv confusion
-
-Always confirm (.venv) is visible in the terminal before running pip install or python ....
-
-8. One-line “How to run” summary (for the presentation slide)
-
-Clone/download the project.
-
-Create & activate a virtualenv.
-
-pip install sounddevice numpy scipy matplotlib
-
-Run:
-
-python audio_input/tejas_audio.py to test mic / .wav input
-
-python ui/instrument_ui.py to launch the UI
+Jan – Tkinter UI, layout, and event wiring
